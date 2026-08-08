@@ -73,7 +73,7 @@ def test_tier_all_does_not_sweep_in_the_pilot():
 
 def test_pilot_runs_only_when_named_explicitly():
     legs = _run_plan(event="workflow_dispatch", tier_sel="pilot", bench_sel="all")
-    assert legs == [("pilot", "spreadsheetbench")]
+    assert sorted(legs) == [("pilot", "spreadsheetbench"), ("pilot", "swebench")]
 
 
 def test_single_bench_dispatch_unchanged():
@@ -102,9 +102,9 @@ def test_unrelated_label_selects_nothing():
     assert _run_plan(event="pull_request", labels=["documentation"]) == []
 
 
-def test_pilot_label_reaches_only_the_benchmark_that_ships_it():
+def test_pilot_label_reaches_only_the_benchmarks_that_ship_it():
     legs = _run_plan(event="pull_request", labels=["benchmark-pilot"])
-    assert legs == [("pilot", "spreadsheetbench")]
+    assert sorted(legs) == [("pilot", "spreadsheetbench"), ("pilot", "swebench")]
 
 
 def test_pilot_label_for_an_unpopulated_bench_selects_nothing():
@@ -113,11 +113,19 @@ def test_pilot_label_for_an_unpopulated_bench_selects_nothing():
 
 # ---- the pilot tier itself --------------------------------------------------
 
-def test_only_spreadsheetbench_ships_a_pilot_tier():
-    """If another benchmark adds one, the assertions above need revisiting deliberately."""
+def test_which_benches_ship_a_pilot_tier():
+    """Pinned deliberately: if another benchmark adds one, the assertions above need
+    revisiting too, because `tier=pilot` and the `benchmark-pilot` label fan out over
+    exactly the benches that ship the tier.
+
+    swebench gained one when the harbor switch made a 250-task full run a multi-day,
+    four-figure proposition: 50 stratified tasks (every repo represented, proportions
+    tracking full) validate the per-trial cost and runtime at 10x smoke's scale before
+    anyone commits to full.
+    """
     shipped = sorted(p.parent.parent.name
                      for p in (REPO / "ci" / "benchmarks").glob("*/pilot/tasks.json"))
-    assert shipped == ["spreadsheetbench"], shipped
+    assert shipped == ["spreadsheetbench", "swebench"], shipped
 
 
 # ---- the missing-checkout regression (run 30682558719) -----------------------

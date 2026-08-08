@@ -24,185 +24,40 @@ uv pip install -p "$CAPEVOLVE_PY" -q $IDX "$REPO/core" litellm
 
 case "$BENCH" in
   swebench)
-    # Harbor is the DEFAULT swebench adapter. It runs a real coding agent (claude-code)
-    # inside its own sandboxed containers and manages its own dataset, so NONE of the
-    # litellm path's machinery applies: no HuggingFace dataset, no oracle context, no
-    # swebench/sweb.eval.* images, no per-instance patch application. The litellm branch
-    # below is kept only until the harbor path is confirmed green, then removed.
+    # Harbor is the ONLY swebench adapter. It runs a real coding agent (claude-code) inside
+    # its own sandboxed containers and manages its own dataset, so none of the removed litellm
+    # path's machinery is needed: no HuggingFace dataset, no oracle context, no
+    # swebench/sweb.eval.* images, no per-instance patch application.
     #
-    # Why the switch: the full tier's 250 task ids come from SWE-bench_Verified, but oracle
-    # context only exists for Lite (46 of the 250), and single-shot blind patching is not a
-    # meaningful target for a mid-tier model. Harbor needs no oracle because the agent
-    # explores the repo itself.
-    SWE_ADAPTER="${SWEBENCH_ADAPTER:-harbor}"
-    echo "swebench adapter: $SWE_ADAPTER"
-    if [ "$SWE_ADAPTER" = "harbor" ]; then
-      # The adapter does `from capevolve_harbor import ...`; that package lives in this repo
-      # and was never installed into the CI venv, so the harbor path would have died on
-      # import. Install it explicitly.
-      uv pip install -p "$CAPEVOLVE_PY" -q $IDX "$REPO/capevolve_harbor"
-      "$CAPEVOLVE_PY" -c "import capevolve_harbor; print('capevolve_harbor OK')"
-      command -v harbor >/dev/null 2>&1 || uv tool install $IDX harbor >/dev/null 2>&1 || true
-      command -v harbor >/dev/null || {
-        echo "::error:: harbor CLI unavailable — the harbor adapter cannot run a single task."
-        exit 1; }
-      echo "harbor: $(command -v harbor)"
-      command -v docker >/dev/null && docker info >/dev/null 2>&1 || {
-        echo "::error:: docker daemon not reachable — harbor runs every task in a container"
-        exit 1; }
-    else
-    # PINNED. These were unpinned, so the grading harness could change under us between
-    # runs with nothing in the log to say it had. Pinned to what skillberry-1 was actually
-    # running on 2026-08-07, verified ON the runner to resolve all 5 smoke ids from
-    # princeton-nlp/SWE-bench_Lite (300-row test split, 0 missing). datasets 5.0.1 was
-    # verified equivalent off-runner; 5.0.0 is pinned because it is the observed-good state
-    # here and the point of a pin is reproducibility, not an untested upgrade.
-    uv pip install -p "$CAPEVOLVE_PY" -q $IDX "swebench==4.1.0" "datasets==5.0.0"
+    # Why: the curated tiers' task ids are SWE-bench_Verified, but oracle code context exists
+    # only for Lite (46 of full's 250 had it), and single-shot blind patching is not a
+    # meaningful target for a mid-tier model. Harbor's agent explores the repo itself.
+    # The adapter does `from capevolve_harbor import ...`; that package lives in this repo
+    # and was never installed into the CI venv, so the harbor path would have died on
+    # import. Install it explicitly.
+    uv pip install -p "$CAPEVOLVE_PY" -q $IDX "$REPO/capevolve_harbor"
+    "$CAPEVOLVE_PY" -c "import capevolve_harbor; print('capevolve_harbor OK')"
     command -v harbor >/dev/null 2>&1 || uv tool install $IDX harbor >/dev/null 2>&1 || true
-
-    # Dataset preflight — WARM ONCE, THEN GO OFFLINE.
-    #
-    # `run_evaluation` re-resolves the dataset over the HF Hub on EVERY call, and
-    # `princeton-nlp/*` is a 307 redirect to `SWE-bench/*`, so each resolution is live Hub
-    # traffic. HF rate-limits unauthenticated requests per source IP and this runner has no
-    # HF_TOKEN (confirmed on skillberry-1). When resolution degrades mid-run the harness
-    # raises
-    #
-    #     ValueError: Some instance IDs not found in dataset!
-    #
-    # AFTER every patch has already been generated. Run 31161200250 lost 11 minutes and
-    # $3.44 of optimizer budget that way, then published `reward 0.000` as a real result.
-    # Its timings show the shape: iteration 1's eval took 10m22s, then 29s, then 6s —
-    # slow-and-retrying, then fast-failing.
-    #
-    # A warning is not enough, because the failure is transient: re-checked later on the
-    # runner, all 5 ids resolve fine, so a preflight that merely verifies would have passed
-    # and the run would still have died. So: resolve every dataset the run needs ONCE here
-    # (warming datasets' cache), fail loudly and cheaply if that can't be done, and then pin
-    # the rest of the job to HF_HUB_OFFLINE so no later call can touch the Hub at all.
-    # Verified on skillberry-1 that both datasets load from the warm cache with offline mode
-    # enabled. This also makes the dataset immutable for the run, which is what a benchmark
-    # wants anyway, and is consistent with pinning the harness above.
-    if [ -n "${HF_TOKEN:-}" ]; then
-      echo "HF Hub: authenticated (HF_TOKEN present)"
-    else
-      echo "HF Hub: unauthenticated (no HF_TOKEN) — warming the cache now and running offline"
+    command -v harbor >/dev/null || {
+      echo "::error:: harbor CLI unavailable — the harbor adapter cannot run a single task."
+      exit 1; }
+    echo "harbor: $(command -v harbor)"
+    command -v docker >/dev/null && docker info >/dev/null 2>&1 || {
+      echo "::error:: docker daemon not reachable — harbor runs every task in a container"
+      exit 1; }
+    # Reap orphaned harbor task containers before starting. Harbor does NOT tear its
+    # containers down when a workflow run is cancelled — 6 were found stranded 27-47 hours
+    # after their runs ended, competing for CPU and memory with whatever ran next. The bench
+    # leg is serialized on this single self-hosted runner, so any *__env-main container alive
+    # at setup time can only be a leftover. (This replaces the sweb.eval.* reaper, which
+    # became dead along with the litellm adapter.)
+    hb_orphans=$(docker ps -aq --filter "name=env-main" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$(printf '%s' "$hb_orphans" | tr -d ' ')" ]; then
+      # shellcheck disable=SC2086 -- intentional word splitting over container ids
+      docker rm -f $hb_orphans >/dev/null 2>&1 || true
+      echo "reaped $(printf '%s' "$hb_orphans" | wc -w | tr -d ' ') orphaned harbor container(s)"
     fi
-    SWE_TASKS="$REPO/ci/benchmarks/swebench/${TIER:-smoke}/tasks.json"
-    if [ -f "$SWE_TASKS" ]; then
-      SWEBENCH_TASKS_JSON="$SWE_TASKS" "$CAPEVOLVE_PY" - <<'PY' || exit 1
-import json, os, sys
-ids = [t["id"] for t in json.load(open(os.environ["SWEBENCH_TASKS_JSON"]))]
-split = os.environ.get("SWEBENCH_SPLIT", "test")
-base = os.environ.get("SWEBENCH_DATASET", "princeton-nlp/SWE-bench_Lite")
-# Oracle context is on by default in run_suite.sh, and it is a SECOND dataset that the
-# adapter resolves over the Hub. Warm it too, or offline mode below breaks tasks().
-wanted = [(base, ids)]
-if os.environ.get("SWEBENCH_ORACLE", "1").strip().lower() in ("1", "true", "yes", "on"):
-    wanted.append((os.environ.get("SWEBENCH_ORACLE_DATASET",
-                                  "princeton-nlp/SWE-bench_Lite_oracle"), None))
-import datasets, swebench
-print(f"swebench {getattr(swebench,'__version__','?')} / datasets {datasets.__version__}"
-      f" -> {split} split, checking {len(ids)} task id(s)")
-from swebench.harness.utils import load_swebench_dataset
-for name, want in wanted:
-    try:
-        got = load_swebench_dataset(name, split, want)
-    except Exception as exc:
-        print(f"::error:: cannot resolve {name}/{split}: {type(exc).__name__}: {str(exc)[:400]}")
-        print("::error:: scoring would fail for EVERY task AFTER the agent had already run,")
-        print("::error:: and the suite would report a 0.000 it never measured.")
-        print("::error:: Check: HF Hub reachability/throttling (set the HF_TOKEN secret), or")
-        print("::error:: a corrupt dataset cache on the runner (~/.cache/huggingface/datasets).")
-        sys.exit(1)
-    print(f"  warmed {name}: {len(got)} row(s)")
-print("swebench dataset preflight OK — pinning the run to the warm cache (offline)")
-PY
-      # Only after a successful warm: no later Hub call, so no mid-run throttling.
-      SWEBENCH_OFFLINE=1
-    fi
-
-    # Pre-pull the tier's eval images. swebench pulls
-    # swebench/sweb.eval.x86_64.<instance> lazily, DURING grading, once per instance
-    # (SWEBENCH_NAMESPACE=swebench). When a pull fails the instance never gets a container,
-    # swebench files it under `error_ids`, and the harness still exits 0 — so a Docker Hub
-    # hiccup or rate-limit becomes a silent per-instance hole in the measurement rather than
-    # a visible failure. Observed across runs 31173670507 and 31179047624: the two instances
-    # with no local image (django__django-11179, pytest-dev__pytest-7432) were the ones that
-    # kept failing, while their manifests are present on Docker Hub (HTTP 200) — i.e. they
-    # are pullable, just not reliably at eval time.
-    #
-    # Pull them up front instead: the images are then warm for every iteration, and a Hub
-    # problem surfaces here, in seconds, naming the instances it will cost us.
-    #
-    # Instance -> image name: swebench replaces "__" with "_1776_"
-    # (django__django-11179 -> sweb.eval.x86_64.django_1776_django-11179).
-    if [ -f "$SWE_TASKS" ] && command -v docker >/dev/null 2>&1; then
-      # Optional Docker Hub auth. Unauthenticated pulls are capped at 100 manifests/hour per
-      # source IP, which this shared runner can exhaust; with creds the cap is far higher.
-      if [ -n "${DOCKERHUB_USER:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
-        printf '%s' "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin >/dev/null 2>&1 \
-          && echo "Docker Hub: authenticated as $DOCKERHUB_USER" \
-          || echo "::warning:: Docker Hub login failed — continuing unauthenticated"
-      else
-        echo "Docker Hub: unauthenticated (no DOCKERHUB_USER/DOCKERHUB_TOKEN) — 100 pulls/hour per IP"
-      fi
-      # Reap orphaned eval containers before starting. Cancelling a benchmarks run kills the
-      # workflow process but NOT the Docker containers swebench started, so each cancellation
-      # leaves `sweb.eval.*` containers running indefinitely — one was observed Up 3 hours,
-      # competing for Docker throughput with the run that replaced it. The bench job is
-      # serialized on this runner (single self-hosted runner, one leg at a time), so any
-      # sweb.eval container alive at setup time can only be a leftover.
-      # Scoped to sweb.eval.* on purpose: harbor's `*__env-main` containers belong to a
-      # different adapter and are not ours to kill.
-      swe_orphans=$(docker ps -aq --filter "name=sweb.eval" 2>/dev/null | tr '\n' ' ')
-      if [ -n "$(printf '%s' "$swe_orphans" | tr -d ' ')" ]; then
-        # shellcheck disable=SC2086 -- intentional word splitting over container ids
-        docker rm -f $swe_orphans >/dev/null 2>&1 || true
-        echo "reaped $(printf '%s' "$swe_orphans" | wc -w | tr -d ' ') orphaned sweb.eval container(s)"
-      fi
-
-      swe_ids=$("$CAPEVOLVE_PY" -c "
-import json,sys
-print(' '.join(t['id'] for t in json.load(open(sys.argv[1]))))" "$SWE_TASKS")
-      # Build the to-pull list first, skipping images already on the runner, then pull the
-      # remainder with BOUNDED CONCURRENCY. swebench pulls in parallel during grading
-      # (--max_workers, 10 here), so a sequential pre-pull would be slower than the behaviour
-      # it replaces — fine for smoke's 5 instances, actively harmful for full's 250. Six is
-      # chosen to stay well under Docker Hub's unauthenticated rate limiting while still
-      # overlapping the (large, ~1GB+) layer downloads.
-      swe_todo="$(mktemp)"; swe_fails="$(mktemp)"
-      swe_total=0
-      for iid in $swe_ids; do
-        swe_total=$((swe_total+1))
-        img="swebench/sweb.eval.x86_64.$(printf '%s' "$iid" | sed 's/__/_1776_/g'):latest"
-        docker image inspect "$img" >/dev/null 2>&1 || printf '%s %s\n' "$iid" "$img" >> "$swe_todo"
-      done
-      swe_need=$(wc -l < "$swe_todo" | tr -d ' ')
-      if [ "$swe_need" -gt 0 ]; then
-        echo "pre-pulling $swe_need of $swe_total eval image(s), 6 at a time"
-        # instance ids contain no spaces, so a space-separated pair is safe for xargs -n 2.
-        # Each worker echoes the instance id on failure; the parent counts those.
-        xargs -P 6 -n 2 sh -c 'docker pull -q "$2" >/dev/null 2>&1 || echo "$1"' _ \
-          < "$swe_todo" > "$swe_fails" 2>/dev/null || true
-      fi
-      swe_failed=$(wc -l < "$swe_fails" | tr -d ' ')
-      swe_missing=$(tr '\n' ' ' < "$swe_fails")
-      for iid in $swe_missing; do
-        echo "::warning:: could not pull the eval image for $iid — it will infra-error during scoring"
-      done
-      rm -f "$swe_todo" "$swe_fails"
-      if [ "$swe_failed" -gt 0 ] && [ "$swe_failed" -eq "$swe_total" ]; then
-        echo "::error:: NONE of the $swe_total eval images could be pulled — Docker Hub is"
-        echo "::error:: unreachable or rate-limited. Every task would infra-error; aborting"
-        echo "::error:: rather than spending the optimizer budget on an unmeasurable run."
-        exit 1
-      fi
-      [ "$swe_failed" -gt 0 ] \
-        && echo "::warning:: $swe_failed/$swe_total eval images unavailable:$swe_missing" \
-        || echo "swebench eval images ready: $swe_total/$swe_total"
-      fi
-    fi ;;
+    ;;
   tau2)
     [ -d "$CACHE/tau2-bench/.git" ] || git clone --depth 1 https://github.com/sierra-research/tau2-bench "$CACHE/tau2-bench"
     uv pip install -p "$CAPEVOLVE_PY" -q $IDX -e "$CACHE/tau2-bench" ;;
@@ -312,13 +167,6 @@ if [ -n "${GITHUB_ENV:-}" ]; then
   {
     echo "CAPEVOLVE_PY=$CAPEVOLVE_PY"
     echo "SKILLSBENCH_SRC=$CACHE/skillsbench-src"
-    # Set only when the swebench dataset preflight above warmed the cache successfully.
-    # Both names are exported because `datasets` moved the flag between versions and the
-    # older one is still honoured; setting both is version-proof.
-    if [ -n "${SWEBENCH_OFFLINE:-}" ]; then
-      echo "HF_HUB_OFFLINE=1"
-      echo "HF_DATASETS_OFFLINE=1"
-    fi
     if [ -n "${SPREADSHEETBENCH_DATA_DIR:-}" ]; then echo "SPREADSHEETBENCH_DATA_DIR=$SPREADSHEETBENCH_DATA_DIR"; fi
     echo "PATH=$HOME/.local/bin:$PATH"
   } >> "$GITHUB_ENV"

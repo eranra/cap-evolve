@@ -285,18 +285,6 @@ jobs:
     env:
       ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
       ANTHROPIC_AUTH_TOKEN: ${{ secrets.ANTHROPIC_AUTH_TOKEN }}
-      # swebench resolves its dataset over the HF Hub on every `run_evaluation` call.
-      # Unauthenticated requests are rate-limited per source IP, and when that resolution
-      # degrades the harness fails with "Some instance IDs not found in dataset!" only
-      # AFTER every patch has been generated. Optional: if the secret is unset, ci_setup.sh
-      # warns and continues rather than blocking the run.
-      HF_TOKEN: ${{ secrets.HF_TOKEN }}
-      # swebench pulls one eval image per instance from Docker Hub. Unauthenticated pulls are
-      # capped at 100 manifests/hour per source IP, and a failed pull silently costs that
-      # instance its measurement (`error_ids`, harness exit 0). Both optional: absent, ci_setup.sh
-      # pre-pulls unauthenticated and warns about anything it could not fetch.
-      DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
-      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
       # Smoke always runs a fixed 3 iterations (cheap, fast regression) — decoupled
       # from the `iterations` input, which only controls the (expensive) full tier
       # (default 10 there — see the `iterations` input above).
